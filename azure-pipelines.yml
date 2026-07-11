@@ -1,0 +1,92 @@
+# Azure Pipelines CI/CD pipeline for CodeAlpha DevOps Task 1.
+#
+# Flow: build a Docker image -> push it to Azure Container Registry (ACR) ->
+# deploy that image to an Azure App Service (Web App for Containers) -> smoke-test it.
+#
+# Prerequisites (see README.md for the full step-by-step):
+#   1. An Azure Container Registry (ACR)
+#   2. An Azure App Service (Linux, "Web App for Containers")
+#   3. A service connection in Azure DevOps to your Azure subscription (name it below)
+#   4. A service connection / registry connection to your ACR (name it below)
+
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  # --- EDIT THESE to match the resources you create in Azure (see README) ---
+  azureSubscriptionServiceConnection: 'codealpha-azure-connection'
+  acrServiceConnection: 'codealpha-acr-connection'
+  acrName: 'codealphaacr'                     # your ACR name, no dots/dashes
+  imageRepository: 'codealpha-cicd-demo'
+  appServiceName: 'codealpha-cicd-demo-app'   # your App Service (Web App) name
+  resourceGroup: 'codealpha-devops-rg'
+  dockerfilePath: '$(Build.SourcesDirectory)/app/Dockerfile'
+  buildContext: '$(Build.SourcesDirectory)/app'
+  tag: '$(Build.BuildId)'
+
+stages:
+  - stage: Build
+    displayName: 'Build and push image to ACR'
+    jobs:
+      - job: BuildAndPush
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: Docker@2
+            displayName: 'Build and push to ACR'
+            inputs:
+              containerRegistry: '$(acrServiceConnection)'
+              repository: '$(imageRepository)'
+              command: 'buildAndPush'
+              Dockerfile: '$(dockerfilePath)'
+              buildContext: '$(buildContext)'
+              tags: |
+                $(tag)
+                latest
+
+  - stage: Deploy
+    displayName: 'Deploy to Azure App Service'
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - deployment: DeployWebApp
+        displayName: 'Deploy container to App Service'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureWebAppContainer@1
+                  displayName: 'Deploy to App Service'
+                  inputs:
+                    azureSubscription: '$(azureSubscriptionServiceConnection)'
+                    appName: '$(appServiceName)'
+                    resourceGroupName: '$(resourceGroup)'
+                    containers: '$(acrName).azurecr.io/$(imageRepository):$(tag)'
+
+  - stage: Verify
+    displayName: 'Smoke test / monitor rollout'
+    dependsOn: Deploy
+    condition: succeeded()
+    jobs:
+      - job: HealthCheck
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              echo "Waiting for the app to warm up..."
+              sleep 20
+              URL="https://$(appServiceName).azurewebsites.net/health"
+              echo "Checking $URL"
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+              echo "HTTP status: $STATUS"
+              if [ "$STATUS" -ne 200 ]; then
+                echo "##vso[task.logissue type=error]Health check failed with status $STATUS"
+                exit 1
+              fi
+              echo "Deployment verified - app is healthy."
+            displayName: 'Curl /health endpoint'
